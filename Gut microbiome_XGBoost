@@ -1,0 +1,198 @@
+# ============================================================
+# 0. Imports
+# ============================================================
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split, LeaveOneOut
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+from sklearn.impute import KNNImputer
+from sklearn.inspection import permutation_importance
+from xgboost import XGBClassifier
+
+# ------------------------------------------------------------
+# Helper: stratified split at subject level
+# ------------------------------------------------------------
+def stratified_group_split(X, y, groups, test_size, random_state=42):
+    """
+    Split indices into train/test at the *group* (subject) level,
+    stratifying by the group's majority class.
+    Returns boolean masks for train / test over the ORIGINAL array.
+    """
+    from sklearn.model_selection import train_test_split
+
+    df_grp = pd.DataFrame({"y": y, "g": groups})
+    grp_lab = df_grp.groupby("g")["y"].agg(lambda z: z.mode()[0])
+
+    g_all = grp_lab.index.values
+    y_all = grp_lab.values
+
+    g_train, g_test = train_test_split(
+        g_all,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y_all
+    )
+    idx_train = np.isin(groups, g_train)
+    idx_test  = np.isin(groups, g_test)
+    return idx_train, idx_test
+
+# ============================================================
+# 1. Read data & encode labels
+# ============================================================
+file_path = '/content/Higher_Control.xlsx'
+data = pd.read_excel(file_path)
+
+labels   = data.iloc[:, 0]
+features = data.iloc[:, 1:]
+label_encoder  = LabelEncoder()
+encoded_labels = label_encoder.fit_transform(labels).astype(int)
+
+if "subject_id" in data.columns:
+    subject_ids = data["subject_id"].values
+else:
+    subject_ids = np.arange(len(data))
+
+# ============================================================
+# 2. 70:15:15 stratified split at subject level
+#    Step 1: carve out 15% test
+#    Step 2: from remaining 85%, take 15/85 ≈ 0.1765 for validation
+# ============================================================
+# ---- First split: train+val vs test (15%)
+idx_trainval, idx_test = stratified_group_split(
+    features.values, encoded_labels, subject_ids, test_size=0.15, random_state=42
+)
+
+X_trainval = features[idx_trainval].copy()
+y_trainval = encoded_labels[idx_trainval]
+g_trainval = subject_ids[idx_trainval]
+
+X_test = features[idx_test].copy()
+y_test = encoded_labels[idx_test]
+g_test = subject_ids[idx_test]
+
+# ---- Second split: within train+val, take ≈17.65% to make 15% overall
+idx_train, idx_val = stratified_group_split(
+    X_trainval.values, y_trainval, g_trainval, test_size=0.1765, random_state=42
+)
+
+X_train = X_trainval[idx_train].copy()
+y_train = y_trainval[idx_train]
+X_val   = X_trainval[idx_val].copy()
+y_val   = y_trainval[idx_val]
+
+print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+
+# Keep feature names for later importance table
+feature_names = X_train.columns
+
+# ============================================================
+# 3. KNN imputation: fit on TRAIN only, apply to VAL/TEST
+# ============================================================
+imputer = KNNImputer(n_neighbors=5, weights="uniform")
+X_train_imp = pd.DataFrame(imputer.fit_transform(X_train),
+                           columns=feature_names, index=X_train.index)
+X_val_imp   = pd.DataFrame(imputer.transform(X_val),
+                           columns=feature_names, index=X_val.index)
+X_test_imp  = pd.DataFrame(imputer.transform(X_test),
+                           columns=feature_names, index=X_test.index)
+
+# Convert to numpy for XGBoost
+X_train_np = X_train_imp.values
+X_val_np   = X_val_imp.values
+X_test_np  = X_test_imp.values
+
+# ============================================================
+# 4. Hyperparameter tuning using validation set.
+#    Training uses LOOCV on the *training* set.
+# ============================================================
+param_grid = [
+    {"n_estimators": 200, "max_depth": 3, "learning_rate": 0.05,
+     "subsample": 0.7, "colsample_bytree": 0.7, "min_child_weight": 5},
+    {"n_estimators": 400, "max_depth": 4, "learning_rate": 0.03,
+     "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 3},
+    {"n_estimators": 300, "max_depth": 5, "learning_rate": 0.05,
+     "subsample": 0.9, "colsample_bytree": 0.8, "min_child_weight": 1},
+]
+
+best_auc = -np.inf
+best_params = None
+best_model  = None
+
+loo = LeaveOneOut()
+
+for params in param_grid:
+    # ---- (a) Train using LOOCV on TRAIN ----
+    loo_preds = np.zeros(len(y_train))
+    for tr_idx, te_idx in loo.split(X_train_np):
+        model = XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
+            use_label_encoder=False,
+            random_state=42,
+            n_jobs=-1,
+            **params
+        )
+        model.fit(X_train_np[tr_idx], y_train[tr_idx])
+        loo_preds[te_idx] = model.predict_proba(X_train_np[te_idx])[:, 1]
+    loo_auc = roc_auc_score(y_train, loo_preds)
+    print(f"Params {params} | TRAIN LOOCV AUC = {loo_auc:.3f}")
+
+    # ---- (b) Fit once on full TRAIN and select via VALIDATION AUC ----
+    model_full = XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="logloss",
+        use_label_encoder=False,
+        random_state=42,
+        n_jobs=-1,
+        **params
+    )
+    model_full.fit(X_train_np, y_train)
+    val_pred = model_full.predict_proba(X_val_np)[:, 1]
+    val_auc  = roc_auc_score(y_val, val_pred)
+    print(f"         VALIDATION AUC = {val_auc:.3f}")
+
+    if val_auc > best_auc:
+        best_auc = val_auc
+        best_params = params
+        best_model  = model_full
+
+print("\nBest validation AUC = {:.3f} with params = {}".format(best_auc, best_params))
+
+# ============================================================
+# 5. Final evaluation on the held-out test set
+# ============================================================
+test_pred = best_model.predict_proba(X_test_np)[:, 1]
+test_auc  = roc_auc_score(y_test, test_pred)
+test_acc  = accuracy_score(y_test, (test_pred > 0.5))
+test_f1   = f1_score(y_test, (test_pred > 0.5))
+
+print("\n*** FINAL TEST PERFORMANCE ***")
+print(f"AUC = {test_auc:.3f}   ACC = {test_acc:.3f}   F1 = {test_f1:.3f}")
+
+# ============================================================
+# 6. Permutation feature importance
+# ============================================================
+perm = permutation_importance(
+    best_model,
+    X_test_np,
+    y_test,
+    n_repeats=30,
+    scoring="roc_auc",
+    n_jobs=-1,
+    random_state=42
+)
+
+imp_df = pd.DataFrame({
+    "feature": feature_names,
+    "importance_mean": perm.importances_mean,
+    "importance_std":  perm.importances_std
+}).sort_values("importance_mean", ascending=False)
+
+print("\nTop 10 ORIGINAL features by permutation importance (test set):")
+print(imp_df.head(10))
+
+# save to Excel
+imp_df.to_excel("perm_importance_original_features.xlsx", index=False)
+print("\nSaved full importance table to perm_importance_original_features.xlsx")
